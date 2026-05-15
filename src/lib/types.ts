@@ -14,7 +14,11 @@ export type RelationType =
   | "竞争"
   | "供应链"
   | "疑似换供"
-  | "海关往来";
+  | "海关往来"
+  /** 来自同一搜索批次写入语料库的共现（非工商登记） */
+  | "同次检索共现"
+  /** 基于父域/二级域的弱关联（仅供参考） */
+  | "父域相近";
 
 export interface CompanyScore {
   activity: number;

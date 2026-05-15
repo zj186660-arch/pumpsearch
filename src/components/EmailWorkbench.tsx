@@ -8,6 +8,13 @@ import { toCsv } from "@/lib/csv";
 import type { LegalBasis } from "@/lib/consent";
 import { CONSENT_POLICY_VERSION, LEGAL_BASIS_LABELS } from "@/lib/consent";
 
+function stripInternalNotes(text: string): string {
+  const marker = "\n---\n内部备注（不发送）";
+  const idx = text.indexOf(marker);
+  if (idx >= 0) return text.slice(0, idx).trimEnd();
+  return text.trimEnd();
+}
+
 const STYLES: { region: string; tone: string; body: string }[] = [
   {
     region: "德国",
@@ -58,6 +65,9 @@ export function EmailWorkbench({
   const [consentLog, setConsentLog] = useState<
     { at: string; targetId: string; targetName: string; legalBasis: LegalBasis; policy: string }[]
   >([]);
+  const [recipients, setRecipients] = useState("");
+  const [sending, setSending] = useState(false);
+  const [sendMessage, setSendMessage] = useState<string | null>(null);
 
   const company = useMemo(() => getCompany(selectedId), [selectedId]);
   const targetName = externalLead?.name ?? company?.name ?? "";
@@ -84,6 +94,50 @@ export function EmailWorkbench({
       },
     ]);
   };
+
+  const sendViaEsp = useCallback(async () => {
+    setSendMessage(null);
+    if (!consentChecked) {
+      setSendMessage("请先勾选联系同意与法律依据。");
+      return;
+    }
+    const to = recipients
+      .split(/[\n,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (to.length === 0) {
+      setSendMessage("请填写至少一个收件人邮箱。");
+      return;
+    }
+    const sub = subject.trim();
+    if (!sub) {
+      setSendMessage("请填写邮件主题。");
+      return;
+    }
+    const text = stripInternalNotes(body);
+    if (!text) {
+      setSendMessage("正文为空：请先生成草稿或自行撰写后再发送。");
+      return;
+    }
+    setSending(true);
+    try {
+      const res = await fetch("/api/email/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ to: to.length === 1 ? to[0] : to, subject: sub, text }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string; id?: string };
+      if (!res.ok || !json.ok) {
+        setSendMessage(json.error || `发送失败（HTTP ${res.status}）`);
+        return;
+      }
+      setSendMessage(json.id ? `已提交发送，Resend id：${json.id}` : "已提交发送。");
+    } catch (e) {
+      setSendMessage(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  }, [body, consentChecked, recipients, subject]);
 
   const exportConsentCsv = useCallback(() => {
     const header = ["recorded_at", "target_id", "target_name", "legal_basis", "policy_version", "operator_note"];
@@ -223,6 +277,17 @@ export function EmailWorkbench({
         </div>
 
         <label className="block text-xs text-slate-500">
+          收件人（每行一个邮箱；也支持逗号 / 分号分隔）
+          <textarea
+            value={recipients}
+            onChange={(e) => setRecipients(e.target.value)}
+            rows={3}
+            placeholder={"buyer@example.com\nprocurement@example.com"}
+            className="mt-1 w-full resize-y rounded-xl border border-white/10 bg-black/40 px-3 py-2 font-mono text-xs text-slate-200 outline-none focus:border-ocean-500/50"
+          />
+        </label>
+
+        <label className="block text-xs text-slate-500">
           主题
           <input
             value={subject}
@@ -240,15 +305,24 @@ export function EmailWorkbench({
           />
         </label>
 
+        {sendMessage ? (
+          <p className="rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-xs text-slate-300">{sendMessage}</p>
+        ) : null}
+        <p className="text-[11px] text-slate-500">
+          发送走 Resend：请在 <code className="text-ocean-300">.env.local</code> 配置{" "}
+          <code className="text-ocean-300">RESEND_API_KEY</code> 与已验证域名下的{" "}
+          <code className="text-ocean-300">EMAIL_FROM</code>。提交前会自动去掉正文中的「内部备注（不发送）」段落。
+        </p>
+
         <div className="flex flex-wrap gap-2">
           <button
             type="button"
-            disabled
-            className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-white/5 px-4 py-2 text-sm text-slate-500"
-            title="需接入 ESP、退订链接与发送审计"
+            onClick={sendViaEsp}
+            disabled={sending}
+            className="inline-flex items-center gap-2 rounded-xl border border-ocean-500/50 bg-ocean-500/15 px-4 py-2 text-sm font-medium text-ocean-100 hover:bg-ocean-500/25 disabled:cursor-not-allowed disabled:opacity-50"
           >
             <Send className="h-4 w-4" />
-            一键发送（待 ESP）
+            {sending ? "发送中…" : "一键发送（Resend）"}
           </button>
           <button
             type="button"

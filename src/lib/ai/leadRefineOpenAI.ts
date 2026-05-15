@@ -5,7 +5,7 @@ import type { LeadRow } from "../leads";
 function maxRefine(): number {
   const v = process.env.OPENAI_REFINE_MAX;
   const n = v ? parseInt(v, 10) : 10;
-  return Number.isFinite(n) && n >= 0 ? Math.min(n, 25) : 10;
+  return Number.isFinite(n) && n >= 0 ? Math.min(n, 150) : 10;
 }
 
 /**

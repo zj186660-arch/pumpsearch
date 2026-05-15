@@ -10,6 +10,8 @@ import { shouldUseGoogleProxy, isGoogleProxyUrlDeclared } from "./net/googleProx
 import type { RawWebHit } from "./searchProviders/rawHit";
 import { rawHitsToLeads } from "./searchProviders/normalize";
 import { fetchFailureHints, formatFetchError } from "./net/fetchErrors";
+import { expandQueryVariants } from "./search/queryExpansion";
+import { appendCorpusFromLeads } from "./graph/corpus";
 
 function hostKey(url: string): string {
   try {
@@ -57,7 +59,9 @@ function serpEnginesTag(): string {
 }
 
 function providerFingerprint(order: string[], bing: boolean, serp: boolean, google: boolean): string {
-  return `v5|${order.join(">")}|bing=${bing ? 1 : 0}|serp=${serp ? 1 : 0}|g=${google ? 1 : 0}|se=${serpEnginesTag()}|gpx=${shouldUseGoogleProxy() ? 1 : 0}`;
+  const qe = Math.min(120, Math.max(1, envInt("PUMPSEARCH_QUERY_EXPAND_MAX", 28)));
+  const mr = Math.min(50_000, Math.max(30, envInt("PUMPSEARCH_MAX_RAW_RESULTS", 4000)));
+  return `v6|${order.join(">")}|bing=${bing ? 1 : 0}|serp=${serp ? 1 : 0}|g=${google ? 1 : 0}|se=${serpEnginesTag()}|gpx=${shouldUseGoogleProxy() ? 1 : 0}|qe=${qe}|mr=${mr}`;
 }
 
 function parseOrder(): string[] {
@@ -74,6 +78,36 @@ function mergeUniqueRaw(hits: RawWebHit[], into: RawWebHit[], seen: Set<string>)
     if (seen.has(hk)) continue;
     seen.add(hk);
     into.push(h);
+  }
+}
+
+async function runProviderStepsForQuery(
+  pumpQ: string,
+  order: string[],
+  keys: { bingKey?: string; serpKey?: string; googleKey?: string; googleCx?: string },
+  raw: RawWebHit[],
+  seenHosts: Set<string>,
+  warnings: string[]
+): Promise<void> {
+  const { bingKey, serpKey, googleKey, googleCx } = keys;
+  for (const step of order) {
+    if (step === "demo") break;
+    if (step === "bing" && bingKey) {
+      const r = await bingWebSearch(pumpQ, bingKey);
+      if (r.errorMessage) warnings.push(`Bing：${r.errorMessage}`);
+      mergeUniqueRaw(r.hits, raw, seenHosts);
+    }
+    if (step === "serpapi" && serpKey) {
+      const r2 = await serpApiSearchAllEngines(pumpQ, serpKey);
+      for (const w of r2.warnings) warnings.push(w);
+      mergeUniqueRaw(r2.hits, raw, seenHosts);
+    }
+    if (step === "google" && googleKey && googleCx) {
+      const maxPages = Math.min(10, Math.max(1, envInt("PUMPSEARCH_CSE_PAGES", 5)));
+      const cse = await googleCustomSearch(pumpQ, googleKey, googleCx, { maxPages });
+      if (cse.errorMessage) warnings.push(`Google CSE：${cse.errorMessage}`);
+      mergeUniqueRaw(cseItemsToRawHits(cse.items), raw, seenHosts);
+    }
   }
 }
 
@@ -200,33 +234,36 @@ async function runGlobalSearchImpl(userQuery: string): Promise<GlobalSearchOutco
     warnings.push("已设置 PUMPSEARCH_SKIP_NETWORK=true：跳过 Bing/SerpAPI/Google 与缓存写入，仅使用演示数据合并逻辑。");
   }
 
-  const pumpQ = buildPumpQuery(q);
+  const sessionPumpQ = buildPumpQuery(q);
   const raw: RawWebHit[] = [];
   const seenHosts = new Set<string>();
 
   if (!skipNetwork) {
-    for (const step of order) {
-      if (step === "demo") break;
-      if (step === "bing" && bingKey) {
-        const r = await bingWebSearch(pumpQ, bingKey);
-        if (r.errorMessage) warnings.push(`Bing：${r.errorMessage}`);
-        mergeUniqueRaw(r.hits, raw, seenHosts);
+    const expandMax = Math.min(120, Math.max(1, envInt("PUMPSEARCH_QUERY_EXPAND_MAX", 28)));
+    const maxRaw = Math.min(50_000, Math.max(30, envInt("PUMPSEARCH_MAX_RAW_RESULTS", 4000)));
+    const variants = expandQueryVariants(q, expandMax);
+    let hitCap = false;
+    for (const variantBase of variants) {
+      if (raw.length >= maxRaw) {
+        hitCap = true;
+        break;
       }
-      if (step === "serpapi" && serpKey) {
-        const r2 = await serpApiSearchAllEngines(pumpQ, serpKey);
-        for (const w of r2.warnings) warnings.push(w);
-        mergeUniqueRaw(r2.hits, raw, seenHosts);
-      }
-      if (step === "google" && googleKey && googleCx) {
-        const maxPages = Math.min(10, Math.max(1, envInt("PUMPSEARCH_CSE_PAGES", 5)));
-        const cse = await googleCustomSearch(pumpQ, googleKey, googleCx, { maxPages });
-        if (cse.errorMessage) warnings.push(`Google CSE：${cse.errorMessage}`);
-        mergeUniqueRaw(cseItemsToRawHits(cse.items), raw, seenHosts);
-      }
+      const pumpQ = buildPumpQuery(variantBase);
+      await runProviderStepsForQuery(pumpQ, order, { bingKey, serpKey, googleKey, googleCx }, raw, seenHosts, warnings);
+    }
+    if (hitCap) {
+      warnings.push(
+        `已达到 PUMPSEARCH_MAX_RAW_RESULTS=${maxRaw} 的原始条数上限（按独立域名去重后），已停止追加更多检索式。可调高上限或缩小 PUMPSEARCH_QUERY_EXPAND_MAX 以控制 API 费用。`
+      );
+    }
+    if (variants.length > 1) {
+      warnings.push(
+        `已启用查询扩展：本轮共 ${variants.length} 组检索式（PUMPSEARCH_QUERY_EXPAND_MAX），合并去重后约 ${raw.length} 条独立站点线索（上限受密钥配额与引擎分页影响）。`
+      );
     }
   }
 
-  let apiLeads = rawHitsToLeads(raw, pumpQ);
+  let apiLeads = rawHitsToLeads(raw, sessionPumpQ);
   if (!skipNetwork) {
     apiLeads = await refineLeadsWithOpenAI(apiLeads);
   }
@@ -243,6 +280,19 @@ async function runGlobalSearchImpl(userQuery: string): Promise<GlobalSearchOutco
     warnings.push(
       "当前未从 Bing/SerpAPI/Google 拉到网页结果：请检查密钥、代理与网络；或暂时使用演示数据继续体验界面。"
     );
+  }
+
+  if (
+    !skipNetwork &&
+    process.env.PUMPSEARCH_SKIP_CORPUS !== "1" &&
+    process.env.PUMPSEARCH_SKIP_CORPUS !== "true" &&
+    apiLeads.length > 0
+  ) {
+    try {
+      await appendCorpusFromLeads(apiLeads, q || "__search__");
+    } catch (e) {
+      warnings.push(`检索语料库写入失败（不影响列表）：${formatFetchError(e)}`);
+    }
   }
 
   const leads = ensureAllLeads(appendDemoLeads(apiLeads, q, appendDemo));

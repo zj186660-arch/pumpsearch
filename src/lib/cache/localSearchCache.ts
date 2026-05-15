@@ -7,7 +7,7 @@ import { mkdir, readFile, writeFile } from "fs/promises";
 import path from "path";
 import type { LeadRow } from "../leads";
 
-const CACHE_VERSION = 5 as const;
+const CACHE_VERSION = 6 as const;
 
 export type SearchCacheFile = {
   version: typeof CACHE_VERSION;

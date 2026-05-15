@@ -20,6 +20,7 @@
 
 # local search cache (generated)
 data/search-cache.json
+data/search-corpus.jsonl
 
 # debug
 npm-debug.log*
